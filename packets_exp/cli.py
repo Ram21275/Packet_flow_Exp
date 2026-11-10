@@ -3,7 +3,7 @@ import torch
 
 
 def main():
-    p = argparse.ArgumentParser(description="Dual conditional-flow packet omission prototype")
+    p = argparse.ArgumentParser(description="Expected-cost packet omission with flow reconstruction")
     p.add_argument("command", choices=["prepare", "synthetic", "train", "teacher", "evaluate", "audit"])
     p.add_argument("--data", default="data/pilot")
     p.add_argument("--out", default="outputs/run")
@@ -27,12 +27,16 @@ def main():
     p.add_argument("--resume")
     p.add_argument("--teacher", default="outputs/teacher.pt")
     p.add_argument("--teacher-windows", type=int, default=20000)
+    p.add_argument("--teacher-noise-draws", type=int, default=8)
     p.add_argument("--receiver-steps", type=int, default=4)
     p.add_argument("--sender-steps", type=int, default=2)
+    p.add_argument("--sender-temperature", type=float, default=.5)
+    p.add_argument("--sender-rank-weight", type=float, default=.25)
+    p.add_argument("--sender-valid-fraction", type=float, default=.1)
     p.add_argument("--drops", type=int, default=1)
     p.add_argument("--train-loss", type=float, default=.02)
     p.add_argument("--rollout-fraction", type=float, default=.25)
-    p.add_argument("--modes", default="full,random,energy,flow")
+    p.add_argument("--modes", default="full,random,energy,learned")
     p.add_argument("--concealment", choices=["flow", "zero"], default="flow")
     p.add_argument("--split", choices=["valid", "test"], default="valid")
     p.add_argument("--eval-limit", type=int, default=20, help="0 means all")
@@ -60,6 +64,10 @@ def main():
         p.error("anchor-every, batch-size, steps and log-every must be positive")
     if not 0 <= a.rollout_fraction <= 1 or not 0 <= a.train_loss < 1:
         p.error("invalid probability")
+    if a.teacher_noise_draws < 1 or a.sender_temperature <= 0 or a.sender_rank_weight < 0:
+        p.error("invalid teacher/selector loss setting")
+    if not 0 < a.sender_valid_fraction < 1:
+        p.error("sender-valid-fraction must be between zero and one")
     if any(n < 0 for n in [a.train_limit, a.valid_limit, a.test_limit, a.eval_limit]):
         p.error("limits must be nonnegative")
     if any(n < 1 for n in [a.audit_train_windows, a.audit_valid_windows,

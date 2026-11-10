@@ -1,4 +1,3 @@
-import itertools
 import json
 import random
 from pathlib import Path
@@ -6,7 +5,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from .data import Windows, load_manifest
-from .models import ConditionalFlow, random_mask, fm_loss, reconstruct
+from .models import (
+    ConditionalFlow,
+    ExpectedCostSelector,
+    fm_loss,
+    omission_actions,
+    random_mask,
+    reconstruct,
+)
 
 
 def seed_all(seed):
@@ -23,7 +29,15 @@ def device_name(value):
 
 def load_model(path, device):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)  # only own/trusted checkpoints
-    model = ConditionalFlow(**ckpt["model_config"]).to(device)
+    config = dict(ckpt["model_config"])
+    kind = config.pop("kind", "conditional_flow")
+    if kind == "expected_cost_selector":
+        model_class = ExpectedCostSelector
+    elif kind == "conditional_flow":
+        model_class = ConditionalFlow
+    else:
+        raise ValueError(f"Unknown checkpoint model kind: {kind}")
+    model = model_class(**config).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, ckpt
@@ -48,6 +62,58 @@ def corrupt_history(model, history, fraction, steps):
     return h
 
 
+@torch.no_grad()
+def expected_action_costs(receiver, original, history, std, action_masks,
+                          noise_draws, receiver_steps):
+    """Estimate every action with repeated draws and common noise per draw."""
+    draws = []
+    for _ in range(noise_draws):
+        common_noise = torch.randn_like(original)
+        costs = []
+        for action_mask in action_masks:
+            mask = action_mask.expand(len(original), -1)
+            reconstruction = reconstruct(
+                receiver,
+                original * mask[..., None],
+                mask,
+                history,
+                receiver_steps,
+                common_noise,
+            )
+            costs.append(((reconstruction - original) * std).square().mean((1, 2)))
+        draws.append(torch.stack(costs, dim=1))
+    draws = torch.stack(draws)
+    return draws.mean(dim=0), draws.std(dim=0, unbiased=False)
+
+
+def normalize_action_costs(costs):
+    relative = costs - costs.min(dim=1, keepdim=True).values
+    return relative / relative.mean(dim=1, keepdim=True).clamp_min(1e-8)
+
+
+def selector_loss(predicted, costs, temperature=.5, rank_weight=.25):
+    """Regress expected regret while treating near-tied actions as soft targets."""
+    target = normalize_action_costs(costs)
+    soft_target = torch.softmax(-target / temperature, dim=1)
+    regression = torch.nn.functional.smooth_l1_loss(predicted, target)
+    ranking = -(soft_target * torch.log_softmax(-predicted / temperature, dim=1)).sum(1).mean()
+    return regression + rank_weight * ranking
+
+
+@torch.no_grad()
+def selector_validation_regret(model, loader, device):
+    model.eval()
+    regrets = []
+    for history, original, action_costs in loader:
+        history = history.to(device)
+        original = original.to(device)
+        action_costs = action_costs.to(device)
+        choice = model(original, history).argmin(dim=1)
+        selected = action_costs.gather(1, choice[:, None]).squeeze(1)
+        regrets.append((selected - action_costs.min(dim=1).values).mean().item())
+    return float(np.mean(regrets))
+
+
 def teacher(args):
     seed_all(args.seed)
     device = device_name(args.device)
@@ -56,46 +122,68 @@ def teacher(args):
     assert_compatible(ckpt, manifest)
     dataset = Windows(args.data, "train")
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    combinations = list(itertools.combinations(range(5), args.drops))
-    saved = {"history": [], "original": [], "target": []}
+    combinations, action_masks = omission_actions(5, args.drops, device)
+    saved = {"history": [], "original": [], "costs": [], "cost_std": []}
     # Distortion measured in unnormalized coefficient space (orthonormal DCT).
     std = torch.tensor(manifest["std"], device=device)
     total = 0
     for hist, original in loader:
         hist, original = hist.to(device), original.to(device)
         hist = corrupt_history(receiver, hist, args.rollout_fraction, args.receiver_steps)
-        b = len(hist)
-        common_noise = torch.randn_like(original)
-        costs, masks = [], []
-        for omitted in combinations:
-            mask = torch.ones(b, 5, device=device)
-            mask[:, list(omitted)] = 0
-            rec = reconstruct(receiver, original*mask[..., None], mask, hist, args.receiver_steps, common_noise)
-            costs.append(((rec-original)*std).square().mean((1, 2)))
-            masks.append(mask)
-        best = torch.stack(costs, 1).argmin(1)
-        target_mask = torch.stack(masks, 1)[torch.arange(b, device=device), best]
+        costs, cost_std = expected_action_costs(
+            receiver,
+            original,
+            hist,
+            std,
+            action_masks,
+            args.teacher_noise_draws,
+            args.receiver_steps,
+        )
         saved["history"].append(hist.cpu())
         saved["original"].append(original.cpu())
-        # A dequantized continuous target for the mask flow; lower means omit.
-        saved["target"].append((2*target_mask-1).cpu())
-        total += b
+        saved["costs"].append(costs.cpu())
+        saved["cost_std"].append(cost_std.cpu())
+        total += len(hist)
+        print(json.dumps({"teacher_windows": total, "target": args.teacher_windows}), flush=True)
         if total >= args.teacher_windows:
             break
     out = {k: torch.cat(v)[:args.teacher_windows] for k, v in saved.items()}
-    out.update(manifest=manifest, drops=args.drops, receiver=str(args.receiver), seed=args.seed)
+    out.update(
+        manifest=manifest,
+        drops=args.drops,
+        receiver=str(args.receiver),
+        seed=args.seed,
+        format="expected_cost_v2",
+        noise_draws=args.teacher_noise_draws,
+        combinations=combinations,
+        action_masks=action_masks.cpu(),
+    )
     path = Path(args.teacher)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(out, path)
-    print(f"Saved {len(out['target'])} training-only teacher windows to {path}", flush=True)
+    print(f"Saved {len(out['costs'])} expected-cost teacher windows to {path}", flush=True)
 
 
 def train(args):
     seed_all(args.seed)
     device = device_name(args.device)
     manifest = load_manifest(args.data)
-    config = dict(dim=manifest["dim"], window=5, width=args.width, context=64, sender=args.stage == "sender")
-    model = ConditionalFlow(**config).to(device)
+    if args.stage == "sender":
+        config = dict(
+            kind="expected_cost_selector",
+            dim=manifest["dim"],
+            window=5,
+            width=args.width,
+            context=64,
+            drops=args.drops,
+            mean=manifest["mean"],
+            std=manifest["std"],
+            sender=True,
+        )
+        model = ExpectedCostSelector(**{k: v for k, v in config.items() if k != "kind"}).to(device)
+    else:
+        config = dict(dim=manifest["dim"], window=5, width=args.width, context=64, sender=False)
+        model = ConditionalFlow(**config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     cuda_amp = device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
@@ -117,8 +205,21 @@ def train(args):
         assert_compatible(cache, manifest)
         if cache["drops"] != args.drops:
             raise ValueError("Teacher omission budget mismatch")
-        dataset = torch.utils.data.TensorDataset(cache["history"], cache["original"], cache["target"])
-        valid = None
+        if cache.get("format") != "expected_cost_v2" or "costs" not in cache:
+            raise ValueError("Legacy hard-label teacher cache; regenerate it with the teacher command")
+        full_dataset = torch.utils.data.TensorDataset(
+            cache["history"], cache["original"], cache["costs"]
+        )
+        valid_count = max(1, round(len(full_dataset) * args.sender_valid_fraction))
+        train_count = len(full_dataset) - valid_count
+        if train_count < 1:
+            raise ValueError("Teacher cache needs at least two windows")
+        dataset, valid_dataset = torch.utils.data.random_split(
+            full_dataset,
+            [train_count, valid_count],
+            generator=torch.Generator().manual_seed(args.seed + 2000),
+        )
+        valid = DataLoader(valid_dataset, batch_size=args.batch_size, num_workers=0)
     else:
         dataset = Windows(args.data, "train")
         valid = DataLoader(Windows(args.data, "valid"), batch_size=args.batch_size, num_workers=0)
@@ -126,6 +227,25 @@ def train(args):
     iterator = iter(loader)
     (out / "config.json").write_text(json.dumps(vars(args), indent=2))
     print(json.dumps({"stage": args.stage, "device": device, "parameters": sum(p.numel() for p in model.parameters()), "windows": len(dataset)}), flush=True)
+    if args.stage == "sender" and start == 0:
+        best = selector_validation_regret(model, valid, device)
+        initial_state = dict(
+            model=model.state_dict(),
+            model_config=config,
+            optimizer=optimizer.state_dict(),
+            scaler=scaler.state_dict(),
+            step=0,
+            best=best,
+            manifest=manifest,
+            args=vars(args),
+        )
+        torch.save(initial_state, out / "best.pt")
+        print(json.dumps({
+            "step": 0,
+            "loss": None,
+            "score": best,
+            "score_kind": "validation_expected_regret_energy_initialization",
+        }), flush=True)
     for step in range(start+1, args.steps+1):
         try:
             batch = next(iterator)
@@ -134,10 +254,7 @@ def train(args):
             batch = next(iterator)
         model.train()
         if args.stage == "sender":
-            hist, original, target = (x.to(device) for x in batch)
-            target = target + .05 * torch.randn_like(target)
-            mask = torch.full((len(hist), 5), 1-args.drops/5, device=device)
-            observed = original
+            hist, original, costs = (x.to(device) for x in batch)
         else:
             hist, target = (x.to(device) for x in batch)
             hist = corrupt_history(model, hist, args.rollout_fraction, args.receiver_steps)
@@ -147,7 +264,15 @@ def train(args):
             observed = target * mask[..., None]
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda" if cuda_amp else "cpu", enabled=cuda_amp):
-            loss = fm_loss(model, target, observed, mask, hist)
+            if args.stage == "sender":
+                loss = selector_loss(
+                    model(original, hist),
+                    costs,
+                    args.sender_temperature,
+                    args.sender_rank_weight,
+                )
+            else:
+                loss = fm_loss(model, target, observed, mask, hist)
         if not torch.isfinite(loss):
             raise FloatingPointError("Nonfinite training loss")
         scaler.scale(loss).backward()
@@ -157,7 +282,9 @@ def train(args):
         scaler.update()
         if step % args.log_every == 0 or step == args.steps:
             score = float(loss.detach())
-            if valid is not None:
+            if args.stage == "sender":
+                score = selector_validation_regret(model, valid, device)
+            elif valid is not None:
                 model.eval()
                 # Fixed validation randomness; retain training RNG state.
                 with torch.random.fork_rng(devices=[torch.cuda.current_device()] if cuda_amp else []):
@@ -174,7 +301,8 @@ def train(args):
                     score = float(np.mean(errors))
             improved = score < best
             best = min(best, score)
-            row = {"step": step, "loss": float(loss.detach()), "score": score, "score_kind": "validation_missing_mse" if valid else "training_fm_only"}
+            score_kind = "validation_expected_regret" if args.stage == "sender" else "validation_missing_mse"
+            row = {"step": step, "loss": float(loss.detach()), "score": score, "score_kind": score_kind}
             print(json.dumps(row), flush=True)
             with (out / "metrics.jsonl").open("a") as f:
                 f.write(json.dumps(row)+"\n")

@@ -28,9 +28,10 @@ def evaluate(args):
     receiver, ckpt = load_model(args.receiver, device)
     assert_compatible(ckpt, manifest)
     sender = None
-    if "flow" in args.modes.split(","):
+    requested_modes = args.modes.split(",")
+    if any(mode in {"flow", "learned"} for mode in requested_modes):
         if not args.sender:
-            raise ValueError("--sender checkpoint required for flow mode")
+            raise ValueError("--sender checkpoint required for learned/flow mode")
         sender, sender_ckpt = load_model(args.sender, device)
         assert_compatible(sender_ckpt, manifest)
         if sender_ckpt["args"]["drops"] != args.drops:
@@ -40,8 +41,8 @@ def evaluate(args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rows = []
-    for mode in args.modes.split(","):
-        if mode not in {"full", "random", "energy", "flow"}:
+    for mode in requested_modes:
+        if mode not in {"full", "random", "energy", "flow", "learned"}:
             raise ValueError(mode)
         channel = Channel(args.loss, args.delay_ms, args.jitter_ms, args.bandwidth_kbps, args.deadline_ms, args.seed, args.burst)
         sender_ms, receiver_ms, scores = [], [], []

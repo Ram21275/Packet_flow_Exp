@@ -1,7 +1,7 @@
-# Dual-flow packet omission experiments
+# Learned packet omission experiments
 
-Simulation-first research prototype: a sender conditional flow selects which
-application frames to omit; a receiver conditional flow reconstructs their content.
+Simulation-first research prototype: a deterministic expected-cost selector chooses
+which application frames to omit; a receiver conditional flow reconstructs them.
 This is **lossy speech reconstruction**, not exact recovery of arbitrary bytes or
 encrypted network packets. There are no trained results or hardware claims yet.
 
@@ -13,9 +13,10 @@ encrypted network packets. There are no trained results or hardware claims yet.
   At 160 coefficients this is 64.8 kb/s payload before headers, NOT a competitive
   speech codec. Changing `--dim` changes the reference rate and bandwidth limit.
 - Receiver conditional flow matching and a small GRU-conditioned velocity MLP.
-- Exact enumeration of the five one-omission masks for training-only teacher
-  targets; immediate coefficient distortion scoring, not future-horizon optimality.
-- Sender continuous flow on dequantized mask scores, followed by hard selection.
+- Exact enumeration of omission masks with repeated common-noise receiver draws.
+  The teacher retains full expected-cost vectors instead of unstable hard winners.
+- Deterministic sender trained with cost regression and soft ranking. It starts as
+  the physical-energy baseline and learns a residual correction to its scores.
 - Receiver history exposure from one self-generated preceding window during
   training; full utterance rollouts during evaluation. Training is not yet a full
   long-horizon joint optimization or an adaptive rate controller.
@@ -102,46 +103,68 @@ it refuses to overwrite an already completed manifest.
 
 ```bash
 python -m packets_exp.cli train --stage receiver --data data/pilot --out outputs/receiver --steps 5000
-python -m packets_exp.cli teacher --data data/pilot --receiver outputs/receiver/best.pt --teacher outputs/teacher.pt --teacher-windows 20000
+python -m packets_exp.cli teacher --data data/pilot --receiver outputs/receiver/best.pt --teacher outputs/teacher.pt --teacher-windows 20000 --teacher-noise-draws 8
 python -m packets_exp.cli train --stage sender --data data/pilot --teacher outputs/teacher.pt --out outputs/sender --steps 3000
-python -m packets_exp.cli evaluate --data data/pilot --receiver outputs/receiver/best.pt --sender outputs/sender/last.pt --out outputs/valid_clean
+python -m packets_exp.cli evaluate --data data/pilot --receiver outputs/receiver/best.pt --sender outputs/sender/best.pt --out outputs/valid_clean
 ```
 
 Receiver `best.pt` uses fixed-mask validation missing-coefficient MSE. Sender
-`best.pt` is based on training FM loss only, so evaluation commands deliberately
-use sender `last.pt`. Choose sender training duration using separate validation
-rollouts, not the test set.
+`best.pt` uses held-out teacher-window expected regret. Old hard-label teacher
+caches and old sender checkpoints are intentionally not resumable as the new
+selector; regenerate the teacher and train the sender into a fresh directory.
 
-Compare `full`, `random`, `energy`, and `flow` under the same slot-indexed channel
+Compare `full`, `random`, `energy`, and `learned` under the same slot-indexed channel
 trace. Full transmission is the codec reference; energy is a simple sender
 baseline. `--concealment zero` gives a nonlearned receiver baseline. All modes
 currently maintain a shadow receiver, so sender time includes that compute;
 baseline sender time is not an optimized conventional codec implementation.
 
-Evaluate seeds 7, 8, and 9; loss 0, .01, .03, .05; both independent and `--burst`;
-flow integration steps 1, 2, and 4. Train independent checkpoints at multiple
-seeds for model-variance claims. Channel-only seeds are insufficient for that.
+Evaluate seeds 7, 8, and 9; loss 0, .01, .03, .05; both independent and `--burst`.
+Train independent checkpoints at multiple seeds for model-variance claims.
+Channel-only seeds are insufficient for that.
 After validation choices are frozen:
 
 ```bash
-python -m packets_exp.cli evaluate --data data/pilot --receiver outputs/receiver/best.pt --sender outputs/sender/last.pt --split test --eval-limit 0 --out outputs/test_clean
+python -m packets_exp.cli evaluate --data data/pilot --receiver outputs/receiver/best.pt --sender outputs/sender/best.pt --split test --eval-limit 0 --out outputs/test_clean
 ```
 
 ## Sender formulation audit
 
-Before extending sender training or changing the flow, run the five-part audit on
+Before extending sender training or changing the selector, run the five-part audit on
 the validation split. It uses fresh train windows for the direct baseline and
 fresh validation windows for all comparisons; the test split remains untouched.
+
+To rerun only the changed sender formulation on the existing Kaggle cache and
+receiver, use fresh v2 paths so the previous experiment remains available:
+
+```bash
+python -m packets_exp.cli teacher \
+  --data /kaggle/working/packets_data_360 \
+  --receiver /kaggle/working/packets_outputs/receiver/best.pt \
+  --teacher /kaggle/working/packets_outputs/teacher_expected_v2.pt \
+  --teacher-windows 20000 \
+  --teacher-noise-draws 8
+
+python -m packets_exp.cli train --stage sender \
+  --data /kaggle/working/packets_data_360 \
+  --teacher /kaggle/working/packets_outputs/teacher_expected_v2.pt \
+  --out /kaggle/working/packets_outputs/sender_v2 \
+  --steps 3000
+```
+
+The new teacher is more expensive than the former one-draw teacher because it
+averages eight receiver draws for every candidate mask. Do not reuse the legacy
+`teacher.pt` or resume the old sender-flow checkpoint.
 
 ```bash
 python -m packets_exp.cli audit \
   --data /kaggle/working/packets_data_360 \
   --receiver /kaggle/working/packets_outputs/receiver/best.pt \
-  --sender /kaggle/working/packets_outputs/sender/last.pt \
-  --out /kaggle/working/packets_outputs/sender_audit \
+  --sender /kaggle/working/packets_outputs/sender_v2/best.pt \
+  --out /kaggle/working/packets_outputs/sender_audit_v2 \
   --audit-train-windows 2000 \
   --audit-valid-windows 500 \
-  --audit-noise-draws 4 \
+  --audit-noise-draws 8 \
   --audit-score-samples 4 \
   --audit-baseline-steps 1000 \
   --audit-integration-steps 1,2,4,8
@@ -149,19 +172,18 @@ python -m packets_exp.cli audit \
 
 The command runs:
 
-1. an oracle-mask benchmark against random, energy and flow selection;
+1. an oracle-mask benchmark against random, energy and learned selection;
 2. teacher-label stability across repeated receiver noise draws;
 3. sender regret relative to the per-window oracle;
-4. sender integration-step and initial-noise ablations; and
+4. selector step/noise invariance (new selectors should be deterministic); and
 5. a deterministic network that directly predicts all mask costs.
 
 Results are written to `summary.json`, `windows.csv`, `integration.csv`, and
 `direct_cost_scorer.pt`. `diagnostic_signals` in the summary applies documented
 heuristic thresholds; these are formulation warnings, not statistical hypothesis
-tests. Evidence against the current flow is strongest when the oracle has useful
-headroom, the direct scorer has substantially lower regret, and the flow result is
-sensitive to integration steps or initial noise. If the oracle barely improves on
-energy, changing the sender model alone is unlikely to help.
+tests. For the new deterministic selector, integration and noise rows should be
+identical. If the oracle barely improves on energy, changing the sender model alone
+is unlikely to help.
 
 `--drops 2` implements 40% omission in non-anchor windows. It is for stress tests,
 allows adjacent omissions across boundaries, and does not enforce a global
@@ -203,9 +225,9 @@ remain required extensions. No bandwidth advantage over modern codecs is claimed
 ```bash
 python -m packets_exp.cli synthetic --data /tmp/flow-data --dim 16
 python -m packets_exp.cli train --data /tmp/flow-data --out /tmp/flow-rx --steps 3 --log-every 1 --width 32 --batch-size 4 --valid-batches 1
-python -m packets_exp.cli teacher --data /tmp/flow-data --receiver /tmp/flow-rx/best.pt --teacher /tmp/flow-teacher.pt --teacher-windows 8 --batch-size 4
+python -m packets_exp.cli teacher --data /tmp/flow-data --receiver /tmp/flow-rx/best.pt --teacher /tmp/flow-teacher.pt --teacher-windows 8 --teacher-noise-draws 2 --batch-size 4
 python -m packets_exp.cli train --stage sender --data /tmp/flow-data --teacher /tmp/flow-teacher.pt --out /tmp/flow-tx --steps 3 --log-every 1 --width 32 --batch-size 4
-python -m packets_exp.cli evaluate --data /tmp/flow-data --receiver /tmp/flow-rx/best.pt --sender /tmp/flow-tx/last.pt --eval-limit 1 --out /tmp/flow-eval
+python -m packets_exp.cli evaluate --data /tmp/flow-data --receiver /tmp/flow-rx/best.pt --sender /tmp/flow-tx/best.pt --eval-limit 1 --out /tmp/flow-eval
 ```
 
 This checks execution and invariants, not reconstruction quality. Run `python -m

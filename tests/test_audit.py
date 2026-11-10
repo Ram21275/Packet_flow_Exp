@@ -56,12 +56,18 @@ def test_diagnostic_signals_flag_a_bad_flow_formulation():
         "flow": {"mean_cost": 1.5, "mean_regret": .5},
     }
     stability = {"mean_modal_agreement": .5}
-    integration = [{"mean_regret": .2}, {"mean_regret": .5}]
+    integration = [
+        {"steps": 1, "mean_regret": .2},
+        {"steps": 1, "mean_regret": .45},
+        {"steps": 2, "mean_regret": .6},
+        {"steps": 2, "mean_regret": .65},
+    ]
     direct = {"mean_regret": .1}
     signals = _diagnostic_signals(base, stability, integration, direct)
     assert signals["teacher_unstable"]
-    assert signals["flow_worse_than_energy"]
-    assert signals["direct_baseline_beats_flow"]
+    assert signals["selector_worse_than_energy"]
+    assert signals["direct_baseline_beats_selector"]
     assert signals["integration_sensitive"]
+    assert signals["selector_noise_sensitive"]
     assert signals["oracle_has_energy_headroom"]
-    assert signals["formulation_concern_count"] == 5
+    assert signals["formulation_concern_count"] == 6

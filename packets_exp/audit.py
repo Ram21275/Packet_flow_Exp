@@ -213,15 +213,21 @@ def _train_direct_baseline(args, train_examples, actions, device):
 
 
 def _diagnostic_signals(policy, stability, integration, direct):
-    flow_regret = policy["flow"]["mean_regret"]
+    selector_key = "learned" if "learned" in policy else "flow"
+    selector_regret = policy[selector_key]["mean_regret"]
     energy_regret = policy["energy"]["mean_regret"]
-    integration_regrets = [row["mean_regret"] for row in integration]
-    integration_range = max(integration_regrets) - min(integration_regrets)
+    by_steps = {}
+    for row in integration:
+        by_steps.setdefault(row["steps"], []).append(row["mean_regret"])
+    step_means = [sum(values) / len(values) for values in by_steps.values()]
+    integration_range = max(step_means) - min(step_means)
+    noise_range = max(max(values) - min(values) for values in by_steps.values())
     concern = {
         "teacher_unstable": stability["mean_modal_agreement"] < .80,
-        "flow_worse_than_energy": policy["flow"]["mean_cost"] > policy["energy"]["mean_cost"],
-        "direct_baseline_beats_flow": direct["mean_regret"] < .90 * max(flow_regret, 1e-12),
-        "integration_sensitive": integration_range > .20 * max(flow_regret, 1e-12),
+        "selector_worse_than_energy": policy[selector_key]["mean_cost"] > policy["energy"]["mean_cost"],
+        "direct_baseline_beats_selector": direct["mean_regret"] < .90 * max(selector_regret, 1e-12),
+        "integration_sensitive": integration_range > .20 * max(selector_regret, 1e-12),
+        "selector_noise_sensitive": noise_range > .20 * max(selector_regret, 1e-12),
         "oracle_has_energy_headroom": energy_regret > .05 * max(policy["oracle"]["mean_cost"], 1e-12),
     }
     concern["formulation_concern_count"] = sum(bool(value) for value in concern.values())
@@ -246,6 +252,11 @@ def audit_sender(args):
         raise ValueError("--sender checkpoint is not a sender model")
     if sender_ckpt["args"]["drops"] != args.drops:
         raise ValueError("Sender checkpoint omission budget differs from --drops")
+    selector_key = (
+        "learned"
+        if sender_ckpt["model_config"].get("kind") == "expected_cost_selector"
+        else "flow"
+    )
     combinations, action_masks = omission_actions(5, args.drops, device)
     train_examples = _collect_examples(
         args,
@@ -290,7 +301,7 @@ def audit_sender(args):
         "oracle": policy_metrics(valid_costs, oracle),
         "random": policy_metrics(valid_costs, random_choices),
         "energy": policy_metrics(valid_costs, valid_examples["energy"]),
-        "flow": policy_metrics(valid_costs, flow_choices),
+        selector_key: policy_metrics(valid_costs, flow_choices),
     }
     stability_values = teacher_stability(valid_examples["cost_draws"])
     stability = {
@@ -338,10 +349,11 @@ def audit_sender(args):
             "train_windows": len(train_examples["original"]),
             "valid_windows": len(valid_examples["original"]),
             "integration_steps": args.audit_integration_steps,
+            "selector_kind": sender_ckpt["model_config"].get("kind", "conditional_flow"),
         },
         "test_1_oracle_benchmark": policy,
         "test_2_teacher_stability": stability,
-        "test_3_sender_regret": policy["flow"],
+        "test_3_sender_regret": policy[selector_key],
         "test_4_integration_ablation": integration,
         "test_5_direct_cost_baseline": direct,
         "diagnostic_signals": signals,
@@ -353,7 +365,7 @@ def audit_sender(args):
         writer.writerows(integration)
     with (output / "windows.csv").open("w", newline="") as handle:
         fields = [
-            "window", "oracle_action", "random_action", "energy_action", "flow_action",
+            "window", "oracle_action", "random_action", "energy_action", "selector_action",
             "direct_action", "teacher_modal_agreement", "teacher_normalized_entropy",
         ] + [f"cost_action_{index}" for index in range(len(combinations))]
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -364,7 +376,7 @@ def audit_sender(args):
                 "oracle_action": int(oracle[index]),
                 "random_action": int(random_choices[index]),
                 "energy_action": int(valid_examples["energy"][index]),
-                "flow_action": int(flow_choices[index]),
+                "selector_action": int(flow_choices[index]),
                 "direct_action": int(direct_choices[index]),
                 "teacher_modal_agreement": float(stability_values["modal_agreement"][index]),
                 "teacher_normalized_entropy": float(stability_values["normalized_entropy"][index]),

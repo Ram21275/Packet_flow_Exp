@@ -3,9 +3,16 @@ import pytest
 import torch
 from cryptography.exceptions import InvalidTag
 from packets_exp.codec import encode_audio, decode_audio, pack_coeff, unpack_coeff
-from packets_exp.models import ConditionalFlow, reconstruct, select, fm_loss
+from packets_exp.models import (
+    ConditionalFlow,
+    ExpectedCostSelector,
+    fm_loss,
+    reconstruct,
+    select,
+)
 from packets_exp.network import Channel
 from packets_exp.data import prepare, load_manifest
+from packets_exp.train import selector_loss
 import soundfile as sf
 
 
@@ -33,6 +40,28 @@ def test_flow_preserves_received_and_budget():
     loss = fm_loss(rx, z, observed, m, h)
     loss.backward()
     assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in rx.parameters())
+
+
+def test_expected_cost_selector_starts_at_physical_energy_and_is_deterministic():
+    selector = ExpectedCostSelector(
+        dim=2, width=8, context=4, mean=[1., 0.], std=[2., 1.]
+    )
+    original = torch.tensor([[[0., 0.], [1., 0.], [2., 0.], [3., 0.], [4., 0.]]])
+    history = torch.zeros(1, 25, 2)
+    first = select(selector, original, history, drops=1, noise=torch.randn(1, 5))
+    second = select(selector, original, history, drops=1, noise=torch.randn(1, 5))
+    assert torch.equal(first, second)
+    assert first.sum() == 4
+    assert first[0, 0] == 0
+
+
+def test_selector_loss_supports_soft_near_tied_costs():
+    predicted = torch.zeros(2, 5, requires_grad=True)
+    costs = torch.tensor([[1., 1., 2., 3., 4.], [2., 2.01, 2.02, 3., 4.]])
+    loss = selector_loss(predicted, costs)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(predicted.grad).all()
 
 
 def test_wire_bytes_authentication_and_deadline():
