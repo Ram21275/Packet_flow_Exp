@@ -4,7 +4,7 @@ import torch
 
 def main():
     p = argparse.ArgumentParser(description="Dual conditional-flow packet omission prototype")
-    p.add_argument("command", choices=["prepare", "synthetic", "train", "teacher", "evaluate"])
+    p.add_argument("command", choices=["prepare", "synthetic", "train", "teacher", "evaluate", "audit"])
     p.add_argument("--data", default="data/pilot")
     p.add_argument("--out", default="outputs/run")
     p.add_argument("--device", default="auto")
@@ -43,7 +43,17 @@ def main():
     p.add_argument("--deadline-ms", type=float, default=100.)
     p.add_argument("--bandwidth-kbps", type=float, default=256.)
     p.add_argument("--anchor-every", type=int, default=10)
+    p.add_argument("--audit-train-windows", type=int, default=2000)
+    p.add_argument("--audit-valid-windows", type=int, default=500)
+    p.add_argument("--audit-noise-draws", type=int, default=4)
+    p.add_argument("--audit-score-samples", type=int, default=4)
+    p.add_argument("--audit-baseline-steps", type=int, default=1000)
+    p.add_argument("--audit-integration-steps", default="1,2,4,8")
     a = p.parse_args()
+    try:
+        a.audit_integration_steps = [int(value) for value in a.audit_integration_steps.split(",")]
+    except ValueError:
+        p.error("audit-integration-steps must be comma-separated integers")
     if not 1 <= a.drops <= 2:
         p.error("initial experiment supports --drops 1 or 2")
     if a.anchor_every < 1 or a.batch_size < 1 or a.steps < 1 or a.log_every < 1:
@@ -52,6 +62,10 @@ def main():
         p.error("invalid probability")
     if any(n < 0 for n in [a.train_limit, a.valid_limit, a.test_limit, a.eval_limit]):
         p.error("limits must be nonnegative")
+    if any(n < 1 for n in [a.audit_train_windows, a.audit_valid_windows,
+                           a.audit_noise_draws, a.audit_score_samples,
+                           a.audit_baseline_steps, *a.audit_integration_steps]):
+        p.error("sender audit counts and integration steps must be positive")
     torch.set_num_threads(a.threads)
     if a.command == "prepare":
         from .data import prepare
@@ -62,9 +76,12 @@ def main():
     elif a.command in ("train", "teacher"):
         from .train import train, teacher
         (train if a.command == "train" else teacher)(a)
-    else:
+    elif a.command == "evaluate":
         from .evaluate import evaluate
         evaluate(a)
+    else:
+        from .audit import audit_sender
+        audit_sender(a)
 
 
 if __name__ == "__main__":

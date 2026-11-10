@@ -127,6 +127,42 @@ After validation choices are frozen:
 python -m packets_exp.cli evaluate --data data/pilot --receiver outputs/receiver/best.pt --sender outputs/sender/last.pt --split test --eval-limit 0 --out outputs/test_clean
 ```
 
+## Sender formulation audit
+
+Before extending sender training or changing the flow, run the five-part audit on
+the validation split. It uses fresh train windows for the direct baseline and
+fresh validation windows for all comparisons; the test split remains untouched.
+
+```bash
+python -m packets_exp.cli audit \
+  --data /kaggle/working/packets_data_360 \
+  --receiver /kaggle/working/packets_outputs/receiver/best.pt \
+  --sender /kaggle/working/packets_outputs/sender/last.pt \
+  --out /kaggle/working/packets_outputs/sender_audit \
+  --audit-train-windows 2000 \
+  --audit-valid-windows 500 \
+  --audit-noise-draws 4 \
+  --audit-score-samples 4 \
+  --audit-baseline-steps 1000 \
+  --audit-integration-steps 1,2,4,8
+```
+
+The command runs:
+
+1. an oracle-mask benchmark against random, energy and flow selection;
+2. teacher-label stability across repeated receiver noise draws;
+3. sender regret relative to the per-window oracle;
+4. sender integration-step and initial-noise ablations; and
+5. a deterministic network that directly predicts all mask costs.
+
+Results are written to `summary.json`, `windows.csv`, `integration.csv`, and
+`direct_cost_scorer.pt`. `diagnostic_signals` in the summary applies documented
+heuristic thresholds; these are formulation warnings, not statistical hypothesis
+tests. Evidence against the current flow is strongest when the oracle has useful
+headroom, the direct scorer has substantially lower regret, and the flow result is
+sensitive to integration steps or initial noise. If the oracle barely improves on
+energy, changing the sender model alone is unlikely to help.
+
 `--drops 2` implements 40% omission in non-anchor windows. It is for stress tests,
 allows adjacent omissions across boundaries, and does not enforce a global
 maximum gap. Default `--drops 1` gives 20% omission in non-anchor windows, with
